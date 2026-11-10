@@ -5,6 +5,11 @@ timed, so a regression in the Mojo kernels shows up as a correctness failure
 rather than as a suspiciously good number. The baseline is `networkx`, the
 fastest reasonable pure-Python implementation of the same algorithms available
 here, and the same graph is used for both.
+
+Same graph, not the same work: `single_source_dijkstra_path_length(G, s, t)`
+computes distances to every node and only selects `t`, while the ported
+`dijkstra` stops at the target. The routing rows therefore favour this package;
+they are not an equal-work comparison. The A* row is the like-for-like one.
 """
 
 from __future__ import annotations

@@ -69,16 +69,34 @@ pixi run test
 
 Best-of-N wall clock in one process, every case gated on numerical agreement
 first. The routing baselines are `networkx`, the fastest reasonable pure-Python
-implementation of the same algorithms available here, on the same graph and the
-same query list. Geometry is against the fastest vectorised NumPy formulation.
+implementation available here, on the same graph and the same query list. That is
+the same *input*, not the same *work*: the networkx calls below run whole-graph
+`single_source_dijkstra_path_length`, which does not stop at the target, while
+the ported `dijkstra` does -- and the CH rows compare networkx Dijkstra against a
+contraction hierarchy, two different algorithms. The A* row is the only
+like-for-like one, because both sides are this package. Geometry is against the
+fastest vectorised NumPy formulation.
 
 | case | reference | mojo-graphhopper-py | result |
 | --- | ---: | ---: | ---: |
-| haversine n=1048576 | 281.81 ms | 39.17 ms | 7.19x faster |
-| dijkstra 60x60, 20 queries | 239.15 ms | 16.51 ms | 14.48x faster |
-| astar 60x60, 20 queries | 19.06 ms (Dijkstra) | 27.09 ms | **0.70x, slower** |
-| ch 40x40, 200 queries | 440.27 ms | 509.37 ms | **0.86x, slower** |
-| ch 40x40, 200 queries + preprocessing | 440.27 ms | 5848.03 ms | **0.08x, much slower** |
+| haversine n=1048576 | 134.58 ms | 38.70 ms | 3.48x faster |
+| dijkstra 60x60, 20 queries | 61.32 ms | 6.85 ms | 8.95x faster |
+| astar 60x60, 20 queries | 6.89 ms (Dijkstra) | 12.76 ms | **0.54x, slower** |
+| ch 40x40, 200 queries | 134.12 ms | 240.47 ms | **0.56x, slower** |
+| ch 40x40, 200 queries + preprocessing | 134.12 ms | 1706.81 ms | **0.08x, much slower** |
+
+These numbers were re-measured in a verification pass on a shared 72-core host
+under load (load average 24-42 over the pass); three consecutive `pixi run
+bench` runs moved haversine's reference by 12% and the Dijkstra ratio between
+7.9x and 9.5x. One later run, at a load average of 36, put the ported haversine
+at 90.85 ms, more than twice every other measurement of it (38.70-42.70 ms in
+five runs); it is reported as host noise rather than discarded, because the
+median of the runs above is what the table carries. `/tmp/mojo-bench.lock` is
+shared with other repositories, so a run can also queue for tens of minutes
+behind another project's benchmark -- that is wall-clock waiting, not timing.
+Within a run every pair is the same graph and the same query list, but the
+absolute milliseconds are this host on that day, not a portable score.
+`bench/verify.md` records the earlier figures these replace and why.
 
 Reported as losses, because they are:
 
@@ -88,13 +106,18 @@ Reported as losses, because they are:
   per query on the Python side. A* wins on geometric graphs where the bound is
   tight; it loses on grids, and this table measures the case where it loses.
 - **Contraction hierarchies lose on 200 queries.** Preprocessing a 40x40 grid
-  costs about 2.8 s of witness searches, and 200 queries are nowhere near
-  enough to amortise it. CH exists to serve millions of queries on a
-  continent-sized graph; the crossover is far outside anything this benchmark
-  measures, so the honest number here is the loss.
-- Dijkstra's 14x is the number that reflects what this port is for: the same
+  costs about 1.7 s of witness searches (measured this pass: 1655-1927 ms across
+  runs), and 200 queries are nowhere near enough to amortise it. CH exists to
+  serve millions of queries on a continent-sized graph; the crossover is far
+  outside anything this benchmark measures, so the honest number here is the
+  loss.
+- Dijkstra's 8.9x is the number that reflects what this port is for: the same
   pointer-chasing loop that networkx runs in Python, with the heap and the
-  relaxations compiled.
+  relaxations compiled. The margin is larger than the milliseconds suggest,
+  because the networkx side here runs `single_source_dijkstra_path_length`,
+  which settles the whole graph instead of stopping at the target: it does more
+  work per query than the ported `dijkstra`, so this row is not an equal-work
+  comparison.
 
 Reproduce with:
 
@@ -102,10 +125,13 @@ Reproduce with:
 pixi run bench
 ```
 
-The haversine row moved from 155.82 ms to 39.17 ms when the elementwise
-geometry kernels were parallelised; before/after and thread-scaling numbers are
-in "Parallelism" below, and so are the paths that were measured and *not*
-parallelised.
+The haversine row moved from 155.82 ms to the low 40s of milliseconds when the
+elementwise geometry kernels were parallelised; before/after and thread-scaling
+numbers are in "Parallelism" below, and so are the paths that were measured and
+*not* parallelised. (The 155.82 ms "before" figure is from the parallel-phase
+work and was not re-measured in the verification pass; the after-side 39.17 ms
+it was paired with did reproduce within 20%, and the interleaved A/B below was
+re-run from the pre-parallel source.)
 
 ## Parallelism
 
@@ -129,38 +155,51 @@ the kernel runs the serial loop unchanged, so small callers are untouched.
 | n | serial | 4 threads | speedup |
 | ---: | ---: | ---: | ---: |
 | 4096 | 0.42 ms | 0.42 ms | 1.00x |
-| 16384 | 1.67 ms | 1.68 ms | 1.00x |
-| 32768 | 3.29 ms | 3.28 ms | 1.00x |
-| 65536 | 6.63 ms | 6.51 ms | 1.02x |
-| 131072 | 13.10 ms | 13.08 ms | 1.00x |
-| 262144 (2^18) | 31.57 ms | 14.00 ms | 2.25x |
-| 524288 | 52.25 ms | 24.43 ms | 2.14x |
-| 1048576 | 107.54 ms | 35.43 ms | 3.04x |
+| 16384 | 1.64 ms | 1.64 ms | 1.00x |
+| 32768 | 3.26 ms | 3.26 ms | 1.00x |
+| 65536 | 6.45 ms | 6.49 ms | 0.99x |
+| 131072 | 13.00 ms | 13.06 ms | 1.00x |
+| 262144 (2^18) | 26.06 ms | 12.61 ms | 2.07x |
+| 524288 | 52.08 ms | 19.27 ms | 2.70x |
+| 1048576 | 104.55 ms | 33.73 ms | 3.10x |
 
-Nothing below 2^18 beats serial: 65536 and 131072 measure at 1.00-1.02x, so at
-that size dispatch and memory traffic consume the entire gain, and an earlier
-run even measured 65536 at 1.20x and 131072 at 0.98x back to back. The first
-size where the win is clear and repeatable is **262144 (2^18)**, at 2.25x. The
-shipped threshold is that measured crossover itself, not an offset above it,
-because the sizes above it are where the gain is stable; callers below it keep
-the serial loop and pay nothing.
+Best of 7, six interleaved rounds per size, measured in the verification pass.
+Nothing below 2^18 beats serial: 65536 and 131072 measure at 0.99-1.00x, so at
+that size dispatch and memory traffic consume the entire gain. The first size
+where the win is clear and repeatable is **262144 (2^18)**: parallel came in
+faster than serial in 6 of 6 rounds there, against 1-5 of 6 below it, which is
+coin-flip noise. The shipped threshold is that measured crossover itself, not an
+offset above it, because the sizes above it are where the gain is stable
+(2.07x at 2^18, 2.70x at 2^19, 3.10x at 2^20); callers below it keep the serial
+loop and pay nothing. (An earlier revision of this section called the crossover
+"2.14x" and applied that figure to `524288` as well; 2.14x is the 4-thread
+*equirectangular* number from the next table, and it was never this crossover's
+speedup. Re-measured, the crossover is 2.07x and `524288` is 2.70x, below.)
 
 **Threads.** Cap is 4 (`PAR_WORKER_CAP`), applied on top of whatever
 `GH_WORKERS` asks for. The host is shared, so the cap is a contract rather
-than a reading of `nproc`. Cases at n=1M, best-of-7:
+than a reading of `nproc`. Cases at n=1M, best-of-7, `bench/parallel.py`:
 
 | case | 1 thread | 2 threads | 4 threads | 4x |
 | --- | ---: | ---: | ---: | ---: |
-| haversine | 104.05 ms | 60.02 ms | 34.72 ms | 3.00x |
-| equirectangular | 23.80 ms | 17.19 ms | 11.11 ms | 2.14x |
-| bearing | 125.13 ms | 80.81 ms | 46.69 ms | 2.68x |
+| haversine | 106.78 ms | 60.68 ms | 34.40 ms | 3.10x |
+| equirectangular | 20.28 ms | 17.43 ms | 11.99 ms | 1.69x |
+| bearing | 121.58 ms | 68.73 ms | 37.32 ms | 3.26x |
 
-The gain does not flatten at 4 for any of the three: all are still close to
-linear between 2 and 4 threads. The cap is kept at 4 anyway -- going past it
-needs a benchmark on an idle host, and this host is not idle. `equirectangular`
-is the weakest (2.14x) because its serial cost is a quarter of `haversine`'s,
-so dispatch is a larger share of each chunk; it is still a clear win at the
-shipped threshold.
+`haversine` and `bearing` are close to linear between 2 and 4 threads (1.76x and
+1.77x at 2 threads, 3.10x and 3.26x at 4). `equirectangular` is the weakest: it
+barely moves between 1 and 2 threads (1.16x) and then jumps to 1.69x at 4, so it
+is the one case that is *not* linear across the range. Its serial cost is a
+quarter of `haversine`'s, so dispatch is a larger share of each chunk; it is
+still a clear win at the shipped threshold. The cap is kept at 4 anyway -- going
+past it needs a benchmark on an idle host, and this host is not idle.
+
+Run-to-run spread on this shared host is real and larger than the differences
+between the first two columns for `equirectangular`: a second pass measured the
+same three kernels at 111.96 / 67.42 / 43.80 ms (2.56x), 25.93 / 18.05 /
+14.06 ms (1.84x) and 131.50 / 75.82 / 45.14 ms (2.91x). Read the 4-thread
+column as 2.9-3.1x for `haversine`, 1.7-1.8x for `equirectangular` and 2.9-3.3x
+for `bearing`, not as three-significant-figure results.
 
 **Before and after, one build against the previous one.** The same script times
 the pre-parallel build (`git show HEAD:src/kernels.mojo`, built separately) and
@@ -169,16 +208,23 @@ both columns:
 
 | case | before | after | before/after |
 | --- | ---: | ---: | ---: |
-| haversine n=1M | 113.57 ms | 39.17 ms | 2.90x |
-| equirectangular n=1M | 20.67 ms | 13.56 ms | 1.52x |
-| bearing n=1M | 124.07 ms | 43.68 ms | 2.84x |
-| edge_weights n=1M | 118.88 ms | 43.84 ms | 2.71x |
-| haversine n=2^18 | 28.67 ms | 14.79 ms | 1.94x |
-| haversine n=65536 | 7.35 ms | 6.73 ms | 1.09x |
+| haversine n=1M | 106.11 ms | 35.38 ms | 3.00x |
+| equirectangular n=1M | 19.80 ms | 12.64 ms | 1.57x |
+| bearing n=1M | 126.09 ms | 45.63 ms | 2.76x |
+| edge_weights n=1M | 113.03 ms | 37.98 ms | 2.98x |
+| haversine n=2^18 | 26.36 ms | 14.88 ms | 1.77x |
+| haversine n=65536 | 6.67 ms | 6.86 ms | 0.97x |
+
+`bench/ab.py OLD_DIR . --reps 9`, re-run in the verification pass from the
+pre-parallel kernel source. A second identical pass landed within 13% on every
+row (haversine 2.86x, equirectangular 1.60x, bearing 2.85x, edge_weights 2.77x,
+2^18 2.04x, 65536 1.05x), and the direction is the same in all six rows in both
+passes.
 
 The last row is the threshold doing its job: 65536 is below 2^18, so both
-columns run the identical serial loop, and the 9% difference there is
-host noise on a shared machine, not an effect of this change.
+columns run the identical serial loop, and the few-percent difference there
+(3% down in one pass, 5% up in the other) is host noise on a shared machine,
+not an effect of this change.
 
 **Identical results, not merely close.** Each kernel's scalar body is a single
 `@always_inline def` called from both the serial loop and the chunk worker, and

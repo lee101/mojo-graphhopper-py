@@ -447,3 +447,38 @@ def test_ch_result_is_a_real_base_graph_path():
     p = ch.route(3, 45)
     for a, b in zip(p.nodes[:-1], p.nodes[1:]):
         assert g._edge_index(int(a), int(b)) >= 0
+
+
+# VERIFY phase: reproduced during the verification pass, not fixed. The greedy
+# contraction shortcuts a node that still has an uncontracted in-neighbour, so
+# the two halves of the two-sided query can disagree and the query returns a
+# dearer path than Bellman-Ford. xfail(strict=True) so a fix flips this to XPASS
+# and fails the suite, forcing the marker to be removed.
+@pytest.mark.xfail(
+    strict=True,
+    reason="CH contraction is unsound when a contracted node keeps an uncontracted "
+    "in-neighbour; see bench/verify.md",
+)
+def test_ch_agrees_with_bellman_ford_when_a_detour_is_cheaper_than_an_edge():
+    """0->1 is dear in isolation, 1->4 is cheapest along 1->5->6->3->4.
+
+    1 has both a contracted in-neighbour (0) and an uncontracted one (5), which
+    is the shape the grid tests and the random-graph test never produce.
+    """
+    n = 7
+    edges = np.array(
+        [[0, 1], [0, 1], [1, 2], [1, 3], [1, 5], [2, 3], [3, 4], [3, 4], [5, 6], [6, 3]],
+        dtype=np.int64,
+    )
+    speeds = np.array(
+        [1.0, 4.0e6, 4.0, 0.5, 4.0, 4.0, 4.0, 4.0e6, 4.0, 4.0], dtype=np.float64
+    )
+    g = mgh.Graph(np.zeros(n), np.arange(n, dtype=np.float64), edges, speeds,
+                  directed=True)
+    ch = g.prepare_ch()
+    for s, t in ((1, 4), (0, 4)):
+        nodes, ref = mgh.reference_shortest_path(g, s, t)
+        assert not math.isinf(ref), (s, t)
+        p = ch.route(s, t)
+        assert p is not None, (s, t)
+        assert p.time == pytest.approx(ref, rel=1e-9, abs=1e-9), (s, t)
