@@ -418,13 +418,29 @@ def gh_astar(n: Int, src: Int, dst: Int, ctx_addr: Int) abi("C") -> Int:
 def fs_find(
     head: I32Ptr, nxt: I32Ptr, to: I32Ptr, w: F64Ptr, src: Int32, dst: Int32
 ) -> Float64:
-    """Cheapest weight of an edge src->dst in a forward star, or BIG if absent."""
+    """Cheapest weight of an edge src->dst in a forward star, or BIG if absent.
+
+    A star may hold several parallel edges between the same pair: every base edge
+    is seeded, and GraphHopper keeps parallel CH edges rather than merging them
+    (CHStorageBuilder.addShortcut appends unconditionally). Returning the first
+    match made the shortcut weight depend on insertion order, so the forward star
+    could carry a dearer u->v than the mirrored reverse star, and no single
+    unpacked path could satisfy both halves of the route.
+
+    Unlike bounded_search, a `w >= BIG` entry is still returned. BIG is an edge
+    weight here, not a sentinel: weighted_search's stale `dist` guard only
+    refreshes an entry whose `d[v] >= BIG`, and a 1e-300 weight cannot pull
+    `d[v]` below BIG, so that guard could never fire.
+    """
+    var best = BIG
     var e = Int(head[unsafe_offset=src])
     while e >= 0:
         if to[unsafe_offset=e] == dst:
-            return w[unsafe_offset=e]
+            var we = w[unsafe_offset=e]
+            if we < best:
+                best = we
         e = Int(nxt[unsafe_offset=e])
-    return BIG
+    return best
 
 
 def fs_add(
