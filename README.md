@@ -112,6 +112,8 @@ parallelised.
 The geometry kernels (`haversine`, `equirectangular`, `bearing`,
 `edge_weights`) split their work over threads. Every other kernel is serial,
 and that is a measured decision, not an oversight -- see "Not parallelised".
+Nothing runs on a GPU; the gate that settles that, and the toolchain limit that
+would have blocked it anyway, are in "GPU: CPU only" below.
 
 `parallelize` comes from `max.algorithm` (the `std` module lost it; see
 `MOJO_NOTES.md` section 4). That means the env pins `max` beside `mojo`:
@@ -222,6 +224,91 @@ pixi run python bench/ab.py OLD_DIR .         # before/after, interleaved
 
 `GH_WORKERS=N` lowers the ceiling for one process; values above 4 are clamped
 down to 4, and `GH_WORKERS=1` runs the serial loop.
+
+## GPU: CPU only, for a measured reason
+
+There is no GPU path in this port. That is a decision backed by two things: the
+arithmetic intensity threshold, and a toolchain limit that was probed, not
+assumed.
+
+**Gate 1, intensity.** `bench/analysis.md` does not exist in this checkout, so
+the intensity was counted from the scalar bodies in `src/kernels.mojo`
+(`_hav_one`, `_equirect_one`, `_bearing_one`, `_edge_weight_one`). Each
+elementwise call reads 4 arrays and writes 1, all `float64`, so 40 bytes per
+pair; `edge_weights` reads a fifth and writes one, 48 bytes.
+
+| kernel | flops/pair | bytes/pair | flops/byte |
+| --- | ---: | ---: | ---: |
+| `haversine` | 29 | 40 | 0.73 |
+| `equirectangular` | 21 | 40 | 0.53 |
+| `bearing` | 30 | 40 | 0.75 |
+| `edge_weights` | 30 | 48 | 0.63 |
+
+Counted from the bodies in `src/kernels.mojo` as multiply/add/divide and one
+flop per libm call: `haversine` is 3 scales, 3 differences, an FMA, 2 `sin`,
+2 `cos`, 4 products, 2 clamps, `sqrt`, `asin` and a final product, 29;
+`equirectangular` is 2 scales, 2 differences, an add, a scale, 4 products and
+`sqrt`, 21; `bearing` is 3 scales, a difference, 4 `sin`/`cos`, 2 products, a
+subtraction, `atan2`, a scale and a wrap, 30; `edge_weights` is `haversine`'s
+29 plus a divide, 30.
+
+All four are **below 2 flops per byte**, so the gate stops them: the verdict is
+CPU only because the kernels are memory-bound and a device round trip cannot pay
+for itself at any size. They are also called at sizes that make it worse: a
+60x60 grid calls `haversine` once on `m = 28320` directed edges, a 40x40 grid on
+12480.
+
+The routing kernels are further below it -- `dijkstra`, `astar` and the CH
+queries are pointer-chasing graph traversals, one load per visited node, with no
+reusable arithmetic.
+
+**Gate 2, the shared device.** `nvidia-smi --query-gpu=memory.free` reported
+`4559 MiB` free on an RTX 5090, so the memory gate passed; it is not the reason.
+
+**The toolchain cannot compile these kernels for the device either.** Every line
+below was produced by a minimal `max.gpu` kernel on the pinned toolchain
+(`mojo 1.2.0.dev2026092905`), refusing at compile time:
+
+| attempt | result |
+| --- | --- |
+| `sin` on `Float64` in a device kernel | `error: constraint failed: DType.float64 is not supported for sin on NVIDIA GPU` |
+| `cos` on `Float64` | same, for `cos` |
+| `asin` on `Float64` | `error: no libcall available for fasin` |
+| `atan2` on `Float64` | `ptxas fatal: Unresolved extern function 'atan2'` |
+| `tan` on `Float64` | same offload-pass failure as `sin` |
+| `sin`/`cos` inside a plain host fallback branch of the same function | still fails: the offload pass runs on the whole function |
+| `@extern("__nv_sin")`, `@extern("sin")` | `ptxas fatal: Unresolved extern function` (libdevice is not linked) |
+| `sin` on `Float32` | compiles and runs |
+
+The failures are consistent when the probes are spaced apart: `sin`, `cos`,
+`tan`, `asin` and `__nv_sin` each reproduced on every one of 2-3 separate runs.
+The one run-to-run difference seen was a bare `Float64` kernel with no trig in
+it (which otherwise builds and runs) reporting `Unresolved extern` twice while
+the device was saturated, and passing again once the load dropped. The refusal
+of the trig calls themselves did not vary.
+
+`haversine`, `equirectangular`, `bearing` and `edge_weights` are built out of
+trigonometry on `Float64`. Dropping to `Float32` would change the results these
+kernels return -- the geometry tests hold the `Float64` path to `rtol=1e-12`,
+and `Float32` trigonometry cannot meet that -- so a `Float32` GPU path would be
+a different, less accurate API, not an accelerated one.
+
+So the elementwise kernels fall out on the intensity gate before the compiler is
+reached, and the compiler would have refused them anyway. What did compile and
+run on this host was verified end to end (`DeviceContext`, `enqueue_copy`,
+`enqueue_function`, `enqueue_create_buffer`, `synchronize` all work, and tail
+predication with `if i < n` was checked); no kernel reached the point of being
+worth timing. There are no before/after GPU numbers to report because no GPU
+path was built, and none are invented here.
+
+The CPU kernels stay as they are, including the 4-thread parallel path above.
+`tests/test_gpu.py` checks that a CPU host is the shipped behaviour: it asserts
+no GPU entry point is exported from the shared library, and re-compiles a
+`Float64` device probe for each construct in the table above, so the first
+toolchain release that lifts the limit fails the suite -- with a message saying
+to measure a GPU path -- rather than leaving this note stale. The probe is built
+with `mojo build`, which reports the refusal at compile time without launching
+anything, so the test needs no device and is not skipped for one.
 
 ## How it works
 
