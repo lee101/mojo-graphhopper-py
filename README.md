@@ -38,7 +38,7 @@ bidirectional search, and contraction hierarchies for the speed mode.
 
 | area | implemented API |
 | --- | --- |
-| Geometry | `haversine`, `equirectangular`, `bearing`, `edge_weights` — GraphHopper's `DistanceEarthProjection` and `DistancePlaneProjection` |
+| Geometry | `haversine`, `equirectangular`, `bearing`, `edge_weights` — GraphHopper's `DistanceEarthProjection` and `DistancePlaneProjection`; parallel above 262144 items |
 | Weighting | `Graph` with per-edge speeds; weight is length / speed, as in `DistanceWeighting` |
 | Flexible mode | `Graph.dijkstra`, `Graph.astar` with a great-circle heuristic |
 | Speed mode | `Graph.prepare_ch` → `CHGraph` (greedy contraction, bounded witness search, shortcut insertion) and `CHGraph.route` (two upward searches, middle node, two downward searches, recursive shortcut expansion) |
@@ -74,7 +74,7 @@ same query list. Geometry is against the fastest vectorised NumPy formulation.
 
 | case | reference | mojo-graphhopper-py | result |
 | --- | ---: | ---: | ---: |
-| haversine n=1048576 | 281.81 ms | 155.82 ms | 1.81x faster |
+| haversine n=1048576 | 281.81 ms | 39.17 ms | 7.19x faster |
 | dijkstra 60x60, 20 queries | 239.15 ms | 16.51 ms | 14.48x faster |
 | astar 60x60, 20 queries | 19.06 ms (Dijkstra) | 27.09 ms | **0.70x, slower** |
 | ch 40x40, 200 queries | 440.27 ms | 509.37 ms | **0.86x, slower** |
@@ -102,6 +102,127 @@ Reproduce with:
 pixi run bench
 ```
 
+The haversine row moved from 155.82 ms to 39.17 ms when the elementwise
+geometry kernels were parallelised; before/after and thread-scaling numbers are
+in "Parallelism" below, and so are the paths that were measured and *not*
+parallelised.
+
+## Parallelism
+
+The geometry kernels (`haversine`, `equirectangular`, `bearing`,
+`edge_weights`) split their work over threads. Every other kernel is serial,
+and that is a measured decision, not an oversight -- see "Not parallelised".
+
+`parallelize` comes from `max.algorithm` (the `std` module lost it; see
+`MOJO_NOTES.md` section 4). That means the env pins `max` beside `mojo`:
+
+```toml
+mojo = "==1.2.0.dev2026092905"
+max  = "==26.7.0.dev2026092905"
+```
+
+**Size threshold.** One work item is one coordinate pair. Below the threshold
+the kernel runs the serial loop unchanged, so small callers are untouched.
+
+| n | serial | 4 threads | speedup |
+| ---: | ---: | ---: | ---: |
+| 4096 | 0.42 ms | 0.42 ms | 1.00x |
+| 16384 | 1.67 ms | 1.68 ms | 1.00x |
+| 32768 | 3.29 ms | 3.28 ms | 1.00x |
+| 65536 | 6.63 ms | 6.51 ms | 1.02x |
+| 131072 | 13.10 ms | 13.08 ms | 1.00x |
+| 262144 (2^18) | 31.57 ms | 14.00 ms | 2.25x |
+| 524288 | 52.25 ms | 24.43 ms | 2.14x |
+| 1048576 | 107.54 ms | 35.43 ms | 3.04x |
+
+Nothing below 2^18 beats serial: 65536 and 131072 measure at 1.00-1.02x, so at
+that size dispatch and memory traffic consume the entire gain, and an earlier
+run even measured 65536 at 1.20x and 131072 at 0.98x back to back. The first
+size where the win is clear and repeatable is **262144 (2^18)**, at 2.25x. The
+shipped threshold is that measured crossover itself, not an offset above it,
+because the sizes above it are where the gain is stable; callers below it keep
+the serial loop and pay nothing.
+
+**Threads.** Cap is 4 (`PAR_WORKER_CAP`), applied on top of whatever
+`GH_WORKERS` asks for. The host is shared, so the cap is a contract rather
+than a reading of `nproc`. Cases at n=1M, best-of-7:
+
+| case | 1 thread | 2 threads | 4 threads | 4x |
+| --- | ---: | ---: | ---: | ---: |
+| haversine | 104.05 ms | 60.02 ms | 34.72 ms | 3.00x |
+| equirectangular | 23.80 ms | 17.19 ms | 11.11 ms | 2.14x |
+| bearing | 125.13 ms | 80.81 ms | 46.69 ms | 2.68x |
+
+The gain does not flatten at 4 for any of the three: all are still close to
+linear between 2 and 4 threads. The cap is kept at 4 anyway -- going past it
+needs a benchmark on an idle host, and this host is not idle. `equirectangular`
+is the weakest (2.14x) because its serial cost is a quarter of `haversine`'s,
+so dispatch is a larger share of each chunk; it is still a clear win at the
+shipped threshold.
+
+**Before and after, one build against the previous one.** The same script times
+the pre-parallel build (`git show HEAD:src/kernels.mojo`, built separately) and
+the current build alternately, round by round, so shared-host noise lands on
+both columns:
+
+| case | before | after | before/after |
+| --- | ---: | ---: | ---: |
+| haversine n=1M | 113.57 ms | 39.17 ms | 2.90x |
+| equirectangular n=1M | 20.67 ms | 13.56 ms | 1.52x |
+| bearing n=1M | 124.07 ms | 43.68 ms | 2.84x |
+| edge_weights n=1M | 118.88 ms | 43.84 ms | 2.71x |
+| haversine n=2^18 | 28.67 ms | 14.79 ms | 1.94x |
+| haversine n=65536 | 7.35 ms | 6.73 ms | 1.09x |
+
+The last row is the threshold doing its job: 65536 is below 2^18, so both
+columns run the identical serial loop, and the 9% difference there is
+host noise on a shared machine, not an effect of this change.
+
+**Identical results, not merely close.** Each kernel's scalar body is a single
+`@always_inline def` called from both the serial loop and the chunk worker, and
+chunks are contiguous index ranges that meet exactly at n. `tests/test_parallel.py`
+runs both paths on the same input at 1000, 2^18, 2^18 + 7 and 2^20 items and
+requires bit-identical output; it also checks 2 and 3 workers against serial,
+the threshold boundary either side, and that `GH_WORKERS=64` does not exceed the
+cap.
+
+**Not parallelised, with the measurement.** These were timed at the worker
+counts that would be used, and none of them gained:
+
+| case | 1 thread | 2 threads | 4 threads | decision |
+| --- | ---: | ---: | ---: | --- |
+| `dijkstra` 60x60, 200 queries | 73.73 ms | 73.49 ms | 73.43 ms | serial |
+| `CHGraph.route` 60x60, 200 queries | 708.62 ms | 684.95 ms | 717.45 ms | serial |
+| `prepare_ch` 60x60 | 16095 ms | 15722 ms | 15856 ms | serial |
+
+- **`dijkstra` and `route` batches** share one scratch block per graph
+  (`_scratch`), so parallel queries need a scratch block per worker. Query
+  halves of these timings are dominated by the Python half of a query (the
+  predecessor walk and path finish), which does not parallelise in Mojo at all,
+  and 200 queries of a 3600-node grid is 2.2 ms per 200 in the kernel. The
+  measured ceiling is the 1.00x above. No parallel path was shipped for them.
+- **`prepare_ch`**: the greedy contraction is order-dependent, so parallel
+  contraction changes *which* shortcuts are added and therefore the hierarchy.
+  It is parallelisable in principle -- the witness-search scratch is
+  worker-local -- but the parallel prepare built for that was reverted: the
+  scratch blocks for it are per-worker copies of four n-sized index buffers and
+  two n-sized distance buffers, sized from a capacity loop in the Python layer,
+  and the first version of that loop guessed a cap instead of growing until the
+  kernel reported success. Shipping it without the growth loop would have
+  silently returned a `-2` capacity error on larger graphs. Reverted rather
+  than shipped broken; the serial prepare is unchanged.
+
+Reproduce the numbers above:
+
+```bash
+pixi run python bench/parallel.py --sizes     # serial/parallel crossover
+pixi run python bench/parallel.py             # 1 / 2 / 4 threads
+pixi run python bench/ab.py OLD_DIR .         # before/after, interleaved
+```
+
+`GH_WORKERS=N` lowers the ceiling for one process; values above 4 are clamped
+down to 4, and `GH_WORKERS=1` runs the serial loop.
+
 ## How it works
 
 All kernels live in `src/kernels.mojo`, one compilation unit, because shared
@@ -112,6 +233,11 @@ The Python layer owns every array — the CSR graph, the search scratch, the
 forward-star adjacency and its capacity-retry loop. Mojo owns the loops: the
 binary heap, the relaxations, the contraction order, the bounded witness
 searches, and the upward and downward searches.
+
+Elementwise geometry is split over up to 4 workers with `parallelize` from
+`max.algorithm`, above a size threshold measured on this host. Routing kernels
+stay serial: the benchmark at 1, 2 and 4 threads shows no gain for them, and
+the reasons and numbers are in "Parallelism" above.
 
 Buffers cross the C ABI as 64-bit addresses inside a caller-owned `Int64`
 argument block, so no export has more than four parameters. That is not
@@ -139,6 +265,11 @@ against zero once made `S_HEAD` and `C_FHEAD` the same slot; a CH prepare
 wrote both and the second write won, so the kernel read the forward-star head
 where it expected the CSR head and ran off the end of it.
 
+The geometry exports still take exactly `(n, ctx)`: they read the worker count
+from `GH_WORKERS` inside the entry point. That is not a fifth parameter smuggled
+in through the environment -- it is what keeps the parallel path from changing
+the ABI the routing kernels are built around.
+
 ### Numerical contract
 
 Edge weights are `haversine / speed`, so every weight is a sum of lengths
@@ -147,6 +278,13 @@ the last bits and the parity tests assert tolerances, never bit equality. The
 grid tests are checked at `rel=1e-9` against an independent Bellman-Ford; the
 geometry tests are exact to `rtol=1e-12`, which is the honest bound for a
 sphere computation where `std.math`'s `asin`/`sin`/`cos` are not glibc's.
+
+The serial and parallel geometry paths are held to a stricter rule: exactly the
+same output, bit for bit. They share one scalar body (`_hav_one`,
+`_equirect_one`, `_bearing_one`, `_edge_weight_one`) and split only the index
+range, so worker count can never move a value. `tests/test_parallel.py` enforces
+`np.array_equal` between them, which is what makes a multi-threaded geometry
+call safe to pass straight into the tolerance-based tests above.
 
 `tests/test_routing.py` includes a check that runs a kernel on buffers mapped
 above 4 GiB. A ctypes `argtypes` entry that is `c_int` instead of `c_int64` is

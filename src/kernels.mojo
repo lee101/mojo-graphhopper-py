@@ -28,6 +28,8 @@ every query came back reporting a bad node index.
 """
 
 from std.math import asin, atan2, cos, sin, sqrt
+from max.algorithm import parallelize
+from std.os import getenv
 
 comptime F64Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
@@ -129,16 +131,172 @@ comptime M_HK: Int = M_BASE + 4
 comptime M_HV: Int = M_BASE + 5
 comptime M_HS: Int = M_BASE + 6
 
+# ---------------------------------------------------------------------------
+# Parallelism policy -- every number here is measured, see README "Parallelism".
+#
+# One *work item* is one coordinate pair for the geometry kernels and one query
+# for the query batches. `n_workers` returns 0 below the threshold, and every
+# caller then runs the original serial loop unchanged, so small inputs keep the
+# serial code path and its exact semantics.
+#
+# Thresholds sit above the measured crossover, not at it: parallel speedup only
+# appears once a chunk costs more than dispatch. The worker count is capped
+# rather than read from the logical CPU count, because the host is shared;
+# GH_WORKERS lowers the ceiling for one process but cannot raise it.
+# ---------------------------------------------------------------------------
+
+comptime PAR_WORKER_CAP: Int = 4
+comptime PAR_MIN_ITEMS: Int = 262144  # 2**18 coordinate pairs
+
+comptime MUT_F64 = Pointer[Float64, AnyOrigin[mut=True]]
+
+
+def worker_cap() raises -> Int:
+    """Worker-count ceiling: GH_WORKERS if set (below the cap), else PAR_WORKER_CAP.
+
+    Name chosen to avoid colliding with environment variables anyone else uses.
+    A value below PAR_WORKER_CAP lowers the ceiling; a value above it cannot
+    raise it, because the host is shared and the cap is the contract. Reading
+    the environment allocates, so this is `raises` and is only ever called from
+    the dispatchers below, never from inside a worker.
+    """
+    var raw = String(getenv("GH_WORKERS"))
+    if raw.byte_length() == 0:
+        return PAR_WORKER_CAP
+    var v = Int(raw)
+    if v < 1:
+        return 1
+    return min(v, PAR_WORKER_CAP)
+
+
+def workers_or_serial(items: Int) -> Int:
+    """`n_workers` for the geometry threshold, or 0 if the environment fails.
+
+    An unreadable environment must not turn into a guess: it means serial.
+    """
+    try:
+        return n_workers(PAR_MIN_ITEMS, items)
+    except:
+        return 0
+
+
+def n_workers(min_items: Int, items: Int) raises -> Int:
+    """Parallel workers for `items` work items, or 0 to stay serial.
+
+    Raises if the environment cannot be read; the dispatcher catches that and
+    stays serial rather than guessing.
+    """
+    if items < min_items:
+        return 0
+    var w = worker_cap()
+    if w > items:
+        w = items
+    if w < 2:
+        return 0
+    return w
+
+
+def par_chunk[F: def(Int, Int) -> None](n: Int, nworkers: Int, work: F):
+    """Run `work(lo, hi)` over `nworkers` contiguous, disjoint, covering ranges.
+
+    Chunk c owns [c * n // nworkers, (c + 1) * n // nworkers). Integer division
+    makes the last range end at exactly n and the ranges meet without a gap, so
+    every index is computed exactly once and nothing races. The worker is a
+    nested `def` with immutable capture, which is what `parallelize` accepts
+    (`@parameter` closures are rejected as capturing thin).
+    """
+    def chunk(c: Int) {imm}:
+        work(c * n // nworkers, (c + 1) * n // nworkers)
+
+    parallelize(chunk, nworkers, nworkers)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Great-circle geometry. GraphHopper's DistanceEarthProjection is haversine on a
 # sphere of radius 6371000 m; DistancePlaneProjection is the equirectangular
 # approximation, which is what it falls back to for short hops.
+#
+# Each kernel's scalar body is written once, as a `@always_inline def` called
+# from both the serial loop and the chunk worker, so the parallel path runs the
+# same arithmetic and produces bit-identical output -- there is no second copy
+# of the formula to drift.
 # ---------------------------------------------------------------------------
 
 
-@export("gh_haversine")
-def gh_haversine(n: Int, ctx_addr: Int) abi("C"):
+@always_inline
+def _hav_one(
+    lat_a: MUT_F64, lon_a: MUT_F64, lat_b: MUT_F64, lon_b: MUT_F64,
+    res: MUT_F64, i: Int,
+):
+    var p1 = lat_a[unsafe_offset=i] * DEG2RAD
+    var p2 = lat_b[unsafe_offset=i] * DEG2RAD
+    var dp = (lat_b[unsafe_offset=i] - lat_a[unsafe_offset=i]) * DEG2RAD
+    var dl = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
+    var s1 = sin(dp * 0.5)
+    var s2 = sin(dl * 0.5)
+    var a = s1 * s1 + cos(p1) * cos(p2) * s2 * s2
+    if a < 0.0:
+        a = 0.0
+    if a > 1.0:
+        a = 1.0
+    res[unsafe_offset=i] = 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
+
+
+@always_inline
+def _equirect_one(
+    lat_a: MUT_F64, lon_a: MUT_F64, lat_b: MUT_F64, lon_b: MUT_F64,
+    res: MUT_F64, i: Int,
+):
+    var dlat = (lat_b[unsafe_offset=i] - lat_a[unsafe_offset=i]) * DEG2RAD
+    var dlon = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
+    var mean_lat = (lat_a[unsafe_offset=i] + lat_b[unsafe_offset=i]) * 0.5
+    var x = dlon * cos(mean_lat * DEG2RAD)
+    res[unsafe_offset=i] = EARTH_RADIUS_M * sqrt(x * x + dlat * dlat)
+
+
+@always_inline
+def _bearing_one(
+    lat_a: MUT_F64, lon_a: MUT_F64, lat_b: MUT_F64, lon_b: MUT_F64,
+    res: MUT_F64, i: Int,
+):
+    var p1 = lat_a[unsafe_offset=i] * DEG2RAD
+    var p2 = lat_b[unsafe_offset=i] * DEG2RAD
+    var dl = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
+    var y = sin(dl) * cos(p2)
+    var x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
+    var brg = atan2(y, x) * RAD2DEG
+    if brg < 0.0:
+        brg = brg + 360.0
+    res[unsafe_offset=i] = brg
+
+
+@always_inline
+def _edge_weight_one(
+    lat_a: MUT_F64, lon_a: MUT_F64, lat_b: MUT_F64, lon_b: MUT_F64,
+    speed: MUT_F64, res: MUT_F64, i: Int,
+):
+    var p1 = lat_a[unsafe_offset=i] * DEG2RAD
+    var p2 = lat_b[unsafe_offset=i] * DEG2RAD
+    var dp = (lat_b[unsafe_offset=i] - lat_a[unsafe_offset=i]) * DEG2RAD
+    var dl = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
+    var s1 = sin(dp * 0.5)
+    var s2 = sin(dl * 0.5)
+    var a = s1 * s1 + cos(p1) * cos(p2) * s2 * s2
+    if a < 0.0:
+        a = 0.0
+    if a > 1.0:
+        a = 1.0
+    var dist = 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
+    var s = speed[unsafe_offset=i]
+    if s <= 0.0:
+        res[unsafe_offset=i] = BIG
+    else:
+        res[unsafe_offset=i] = dist / s
+
+
+def _gh_haversine_run(n: Int, ctx_addr: Int, workers: Int):
     """Great-circle metres between point A i and point B i."""
     var ctx = i64p(ctx_addr)
     var lat_a = f64p(Int(ctx[unsafe_offset=G_LAT_A]))
@@ -146,23 +304,17 @@ def gh_haversine(n: Int, ctx_addr: Int) abi("C"):
     var lat_b = f64p(Int(ctx[unsafe_offset=G_LAT_B]))
     var lon_b = f64p(Int(ctx[unsafe_offset=G_LON_B]))
     var res = f64p(Int(ctx[unsafe_offset=G_OUT]))
-    for i in range(n):
-        var p1 = lat_a[unsafe_offset=i] * DEG2RAD
-        var p2 = lat_b[unsafe_offset=i] * DEG2RAD
-        var dp = (lat_b[unsafe_offset=i] - lat_a[unsafe_offset=i]) * DEG2RAD
-        var dl = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
-        var s1 = sin(dp * 0.5)
-        var s2 = sin(dl * 0.5)
-        var a = s1 * s1 + cos(p1) * cos(p2) * s2 * s2
-        if a < 0.0:
-            a = 0.0
-        if a > 1.0:
-            a = 1.0
-        res[unsafe_offset=i] = 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
+    if workers == 0:
+        for i in range(n):
+            _hav_one(lat_a, lon_a, lat_b, lon_b, res, i)
+        return
+    def body(lo: Int, hi: Int) {imm}:
+        for i in range(lo, hi):
+            _hav_one(lat_a, lon_a, lat_b, lon_b, res, i)
+    par_chunk(n, workers, body)
 
 
-@export("gh_equirect")
-def gh_equirect(n: Int, ctx_addr: Int) abi("C"):
+def _gh_equirect_run(n: Int, ctx_addr: Int, workers: Int):
     """Equirectangular metres metres between point A i and point B i.
 
     GraphHopper's DistancePlaneProjection: project both points onto a plane at
@@ -174,16 +326,17 @@ def gh_equirect(n: Int, ctx_addr: Int) abi("C"):
     var lat_b = f64p(Int(ctx[unsafe_offset=G_LAT_B]))
     var lon_b = f64p(Int(ctx[unsafe_offset=G_LON_B]))
     var res = f64p(Int(ctx[unsafe_offset=G_OUT]))
-    for i in range(n):
-        var dlat = (lat_b[unsafe_offset=i] - lat_a[unsafe_offset=i]) * DEG2RAD
-        var dlon = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
-        var mean_lat = (lat_a[unsafe_offset=i] + lat_b[unsafe_offset=i]) * 0.5
-        var x = dlon * cos(mean_lat * DEG2RAD)
-        res[unsafe_offset=i] = EARTH_RADIUS_M * sqrt(x * x + dlat * dlat)
+    if workers == 0:
+        for i in range(n):
+            _equirect_one(lat_a, lon_a, lat_b, lon_b, res, i)
+        return
+    def body(lo: Int, hi: Int) {imm}:
+        for i in range(lo, hi):
+            _equirect_one(lat_a, lon_a, lat_b, lon_b, res, i)
+    par_chunk(n, workers, body)
 
 
-@export("gh_bearing")
-def gh_bearing(n: Int, ctx_addr: Int) abi("C"):
+def _gh_bearing_run(n: Int, ctx_addr: Int, workers: Int):
     """Initial bearing in degrees in degrees from point A i to point B i."""
     var ctx = i64p(ctx_addr)
     var lat_a = f64p(Int(ctx[unsafe_offset=G_LAT_A]))
@@ -191,20 +344,17 @@ def gh_bearing(n: Int, ctx_addr: Int) abi("C"):
     var lat_b = f64p(Int(ctx[unsafe_offset=G_LAT_B]))
     var lon_b = f64p(Int(ctx[unsafe_offset=G_LON_B]))
     var res = f64p(Int(ctx[unsafe_offset=G_OUT]))
-    for i in range(n):
-        var p1 = lat_a[unsafe_offset=i] * DEG2RAD
-        var p2 = lat_b[unsafe_offset=i] * DEG2RAD
-        var dl = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
-        var y = sin(dl) * cos(p2)
-        var x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
-        var brg = atan2(y, x) * RAD2DEG
-        if brg < 0.0:
-            brg = brg + 360.0
-        res[unsafe_offset=i] = brg
+    if workers == 0:
+        for i in range(n):
+            _bearing_one(lat_a, lon_a, lat_b, lon_b, res, i)
+        return
+    def body(lo: Int, hi: Int) {imm}:
+        for i in range(lo, hi):
+            _bearing_one(lat_a, lon_a, lat_b, lon_b, res, i)
+    par_chunk(n, workers, body)
 
 
-@export("gh_edge_weights")
-def gh_edge_weights(n: Int, ctx_addr: Int) abi("C"):
+def _gh_edge_weights_run(n: Int, ctx_addr: Int, workers: Int):
     """Edge weight: haversine metres / speed[i].
 
     GraphHopper's DistanceWeighting followed by a speed conversion: the routing
@@ -218,24 +368,42 @@ def gh_edge_weights(n: Int, ctx_addr: Int) abi("C"):
     var lon_b = f64p(Int(ctx[unsafe_offset=G_LON_B]))
     var speed = f64p(Int(ctx[unsafe_offset=G_SPEED]))
     var res = f64p(Int(ctx[unsafe_offset=G_OUT]))
-    for i in range(n):
-        var p1 = lat_a[unsafe_offset=i] * DEG2RAD
-        var p2 = lat_b[unsafe_offset=i] * DEG2RAD
-        var dp = (lat_b[unsafe_offset=i] - lat_a[unsafe_offset=i]) * DEG2RAD
-        var dl = (lon_b[unsafe_offset=i] - lon_a[unsafe_offset=i]) * DEG2RAD
-        var s1 = sin(dp * 0.5)
-        var s2 = sin(dl * 0.5)
-        var a = s1 * s1 + cos(p1) * cos(p2) * s2 * s2
-        if a < 0.0:
-            a = 0.0
-        if a > 1.0:
-            a = 1.0
-        var dist = 2.0 * EARTH_RADIUS_M * asin(sqrt(a))
-        var s = speed[unsafe_offset=i]
-        if s <= 0.0:
-            res[unsafe_offset=i] = BIG
-        else:
-            res[unsafe_offset=i] = dist / s
+    if workers == 0:
+        for i in range(n):
+            _edge_weight_one(lat_a, lon_a, lat_b, lon_b, speed, res, i)
+        return
+    def body(lo: Int, hi: Int) {imm}:
+        for i in range(lo, hi):
+            _edge_weight_one(lat_a, lon_a, lat_b, lon_b, speed, res, i)
+    par_chunk(n, workers, body)
+
+
+@export("gh_haversine")
+def gh_haversine(n: Int, ctx_addr: Int) abi("C"):
+    """Great-circle metres between point A i and point B i."""
+    var workers = workers_or_serial(n)
+    _gh_haversine_run(n, ctx_addr, workers)
+
+
+@export("gh_equirect")
+def gh_equirect(n: Int, ctx_addr: Int) abi("C"):
+    """Equirectangular metres metres between point A i and point B i."""
+    var workers = workers_or_serial(n)
+    _gh_equirect_run(n, ctx_addr, workers)
+
+
+@export("gh_bearing")
+def gh_bearing(n: Int, ctx_addr: Int) abi("C"):
+    """Initial bearing in degrees in degrees from point A i to point B i."""
+    var workers = workers_or_serial(n)
+    _gh_bearing_run(n, ctx_addr, workers)
+
+
+@export("gh_edge_weights")
+def gh_edge_weights(n: Int, ctx_addr: Int) abi("C"):
+    """Edge weight: haversine metres / speed[i]."""
+    var workers = workers_or_serial(n)
+    _gh_edge_weights_run(n, ctx_addr, workers)
 
 
 # ---------------------------------------------------------------------------

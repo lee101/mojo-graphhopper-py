@@ -97,9 +97,12 @@ def main():
                  best(lambda: [g.astar(s, t) for s, t in pairs], reps)))
 
     # the Python half of a query: predecessor walk plus path finish
+    # sc.prev is whatever the last kernel call left behind, so re-run the search
+    # that produced it rather than reading a buffer from a different pair.
     def python_half():
         for s, t in pairs[:20]:
-            g._finish(g._path_from_prev(sc.prev, s, t))
+            if lib.gh_dijkstra(g.n, s, t, caddr) == 1:
+                g._finish(g._path_from_prev(sc.prev, s, t))
     rows.append(("path_from_prev+finish x20", best(python_half, reps)))
 
     # --- CH -----------------------------------------------------------------
